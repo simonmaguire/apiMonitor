@@ -20,11 +20,12 @@ def getApis(client):
 def callAllApis(apis):
     allPermitDates = {}
 
-    headers ={'authority': 'www.recreation.gov',
+    headers ={'authority': os.getenv('API-AUTHORITY'),
                   'content-type': 'application/json; charset=utf-8',
                   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36'
                   }
     try:
+        issueAPIs = []
         for id in apis.keys():
             url = apis[id]['url']
             response = requests.get(
@@ -37,10 +38,15 @@ def callAllApis(apis):
                 if(x[day]['remaining'] == 0): continue
                 availableDates.append(day)
             allPermitDates[id] = availableDates
+            if(len(availableDates) > 3):
+                for day in availableDates:
+                    if(x[day]['remaining'] == x[day]['total']):
+                        issueAPIs.append({'id': id, 'res' : x})
+                        break
 
     except:
          print('callAllApis Exception')
-    return allPermitDates
+    return allPermitDates, issueAPIs
 
 def checkForNew(curr, prev):
     if(len(curr) == 0):
@@ -50,7 +56,7 @@ def checkForNew(curr, prev):
             return True
     return False
 
-def composeEmail(storedApiInfo, currentDates):
+def composeEmail(storedApiInfo, currentDates, issues):
     built_text = 'Avalable Dates \n\n'
     unavailable = []
     for api_id in storedApiInfo.keys():
@@ -64,6 +70,9 @@ def composeEmail(storedApiInfo, currentDates):
         built_text += "\n\n"
     for api_id in unavailable:
         built_text += f"{storedApiInfo[api_id]['name']} is unavailable\n\n"
+    for issue in issues:
+        built_text += f"{storedApiInfo[issue['id']]['name']} has some issues with checking availability\n"
+        built_text += f"{issue['res']}\n"
     return built_text
 
 def sendEmail(built_text, recipients): 
@@ -82,27 +91,38 @@ def sendEmail(built_text, recipients):
         )
     print(res.reason)
 
+def hasUnsentDays(curr, sent):
+    for day in curr:
+        if day not in sent:
+            return True
+    return False
+
 def lambda_handler(event, context):
     try:
         session = boto3.Session()
         client = session.resource("dynamodb", region_name='us-east-2')
         
         apis = getApis(client)
-        currentDates = callAllApis(apis)
+        currentDates, issues = callAllApis(apis)
+        hasIssues = len(issues) > 0
+        if(hasIssues):
+            return{'statusCode': 200}
 
         table_name = "apis-to-monitor"      
         table = client.Table(table_name)
         hasNewDates = False
-        for date in currentDates.keys():
-             hasNewDates = hasNewDates or checkForNew(currentDates[date], apis[date]['available_days'])
-             response = table.update_item(
-                Key={"api_id": date},
+        for permit in currentDates.keys():
+            hasNewDates = hasNewDates or checkForNew(currentDates[permit], apis[permit]['available_days'])
+            hasNewDates = hasNewDates and hasUnsentDays(currentDates[permit], apis[permit]['sent_today'])
+
+            response = table.update_item(
+                Key={"api_id": permit},
                 UpdateExpression="set #available_days = :l",
                 ExpressionAttributeNames={
                     "#available_days": "available_days",
                 },
                 ExpressionAttributeValues={
-                    ":l": currentDates[date],
+                    ":l": currentDates[permit],
                 },
                 ReturnValues="UPDATED_NEW",
             )
@@ -117,7 +137,22 @@ def lambda_handler(event, context):
                 if('tester' not in person.keys()): continue
                 recipients.append({'email' : person['email'], 'first_name': person['first_name']})
             
-            sendEmail(composeEmail(apis, currentDates), recipients)
+            sendEmail(composeEmail(apis, currentDates, issues), recipients)
+
+            for permit in currentDates.keys():
+                if(currentDates[permit] == []):
+                    continue
+                response = table.update_item(
+                    Key={"api_id": permit},
+                    UpdateExpression="add #sent_today :l",
+                    ExpressionAttributeNames={
+                        "#sent_today": "sent_today",
+                    },
+                    ExpressionAttributeValues={
+                        ":l": set(currentDates[permit]),
+                    },
+                    ReturnValues="UPDATED_NEW",
+                )
 
 
     except Exception as e:
